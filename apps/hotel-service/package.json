@@ -1,0 +1,36 @@
+{
+  "name": "hotel-service",
+  "version": "1.0.0",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js",
+    "test": "jest --coverage",
+    "lint": "eslint src/"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "pg": "^8.11.3",
+    "kafkajs": "^2.2.4",
+    "joi": "^17.11.0",
+    "winston": "^3.11.0",
+    "express-prometheus-middleware": "^1.2.0",
+    "@opentelemetry/api": "^1.7.0",
+    "@opentelemetry/sdk-node": "^0.45.1",
+    "@opentelemetry/exporter-jaeger": "^1.18.1",
+    "@opentelemetry/instrumentation-express": "^0.34.0",
+    "@opentelemetry/instrumentation-http": "^0.45.1",
+    "@opentelemetry/resources": "^1.18.1",
+    "@opentelemetry/semantic-conventions": "^1.18.1",
+    "dotenv": "^16.3.1",
+    "cors": "^2.8.5",
+    "helmet": "^7.1.0",
+    "morgan": "^1.10.0"
+  },
+  "devDependencies": {
+    "jest": "^29.7.0",
+    "supertest": "^6.3.3",
+    "nodemon": "^3.0.2",
+    "eslint": "^8.54.0"
+  }
+}

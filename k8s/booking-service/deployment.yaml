@@ -1,0 +1,173 @@
+# ─── ConfigMap ────────────────────────────────────────────────────────────────
+# Non-secret config injected as env vars into pods.
+# Secrets (DB passwords, API keys) go in a Secret object (or AWS Secrets Manager).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: booking-service-config
+  namespace: booking
+data:
+  NODE_ENV: "production"
+  PORT: "3001"
+  LOG_LEVEL: "info"
+  # In K8s, services talk to each other using DNS names:
+  # <service-name>.<namespace>.svc.cluster.local
+  # CoreDNS resolves this to the ClusterIP of the Service.
+  INVENTORY_SERVICE_URL: "http://inventory-service.booking.svc.cluster.local:3003"
+  REDIS_URL: "redis://redis.booking.svc.cluster.local:6379"
+  KAFKA_BROKERS: "kafka-broker-0.kafka.svc.cluster.local:9092,kafka-broker-1.kafka.svc.cluster.local:9092"
+  JAEGER_ENDPOINT: "http://jaeger-collector.monitoring.svc.cluster.local:14268/api/traces"
+---
+# ─── Deployment ───────────────────────────────────────────────────────────────
+# A Deployment manages a ReplicaSet, which manages Pods.
+# You never create Pods directly — the Deployment ensures the desired count.
+#
+# Flow:
+#   Developer pushes code →
+#   Jenkins builds image →
+#   Jenkins runs: kubectl set image deployment/booking-service booking-service=<new-image>
+#   K8s does a rolling update: brings up new pods, then kills old ones
+#   Zero downtime!
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: booking-service
+  namespace: booking
+  labels:
+    app: booking-service
+    version: "1.0.0"
+spec:
+  replicas: 3  # 3 pods across 3 nodes = high availability
+  selector:
+    matchLabels:
+      app: booking-service  # must match pod template labels
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1        # during update: at most 4 pods (3+1)
+      maxUnavailable: 0  # during update: always keep 3 pods running → zero downtime
+  template:
+    metadata:
+      labels:
+        app: booking-service
+        version: "1.0.0"
+      annotations:
+        # Prometheus auto-discovery: tells Prometheus to scrape this pod
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "3001"
+        prometheus.io/path: "/metrics"
+    spec:
+      # Pod Anti-Affinity: spread pods across DIFFERENT nodes
+      # so a node failure doesn't take down all 3 replicas
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values: [booking-service]
+                topologyKey: kubernetes.io/hostname
+
+      # serviceAccountName gives the pod an IAM role (via IRSA on EKS)
+      serviceAccountName: booking-service-sa
+
+      # terminationGracePeriodSeconds: how long K8s waits after SIGTERM before SIGKILL
+      # Must be longer than your graceful shutdown window (we use 10s in app)
+      terminationGracePeriodSeconds: 30
+
+      containers:
+        - name: booking-service
+          # Jenkins replaces this image tag on every build
+          image: <AWS_ACCOUNT_ID>.dkr.ecr.us-east-1.amazonaws.com/booking-service:latest
+          imagePullPolicy: Always
+          ports:
+            - containerPort: 3001
+              name: http
+          envFrom:
+            - configMapRef:
+                name: booking-service-config
+          env:
+            # Secret values come from Kubernetes Secret (or AWS Secrets Manager via CSI driver)
+            - name: DB_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: booking-db-secret
+                  key: host
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: booking-db-secret
+                  key: password
+            - name: DB_USER
+              valueFrom:
+                secretKeyRef:
+                  name: booking-db-secret
+                  key: username
+            - name: DB_NAME
+              valueFrom:
+                secretKeyRef:
+                  name: booking-db-secret
+                  key: dbname
+
+          # Resource requests: what the scheduler uses to decide which node to place the pod on
+          # Resource limits: hard ceiling — exceeding CPU throttles, exceeding memory kills the pod
+          resources:
+            requests:
+              cpu: "100m"      # 0.1 CPU core
+              memory: "128Mi"
+            limits:
+              cpu: "500m"      # 0.5 CPU core
+              memory: "512Mi"
+
+          # Liveness probe: K8s restarts the pod if this fails 3 times
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 3001
+            initialDelaySeconds: 15  # wait 15s after start before first check
+            periodSeconds: 10
+            failureThreshold: 3
+
+          # Readiness probe: K8s removes pod from Service load balancer if this fails
+          # Pod stays running but gets no traffic until ready again
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 3001
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            failureThreshold: 3
+
+          # Startup probe: gives slow-starting apps more time before liveness kicks in
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: 3001
+            failureThreshold: 30   # 30 * 10s = 5 minutes max startup time
+            periodSeconds: 10
+
+          # Mount read-only filesystem for security
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            runAsNonRoot: true
+            runAsUser: 1000
+            capabilities:
+              drop: [ALL]
+
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp  # writable temp dir even with readOnlyRootFilesystem
+
+      volumes:
+        - name: tmp
+          emptyDir: {}
+
+      # Pod Security Context
+      securityContext:
+        runAsNonRoot: true
+        seccompProfile:
+          type: RuntimeDefault

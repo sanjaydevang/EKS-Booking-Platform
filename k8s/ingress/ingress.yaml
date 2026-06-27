@@ -1,0 +1,111 @@
+# ─── Ingress ──────────────────────────────────────────────────────────────────
+# Ingress is the L7 (HTTP/HTTPS) router for the cluster.
+# ONE LoadBalancer (AWS ALB) instead of one per service = saves $$$
+#
+# How it works:
+#   Internet → Route53 → ALB → Ingress Controller (AWS Load Balancer Controller)
+#                                    → routes to Services based on path/host
+#                                    → Services → Pods
+#
+# The Ingress Controller watches this YAML and configures the ALB automatically.
+# Install: helm install aws-load-balancer-controller eks/aws-load-balancer-controller
+
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: booking-platform-ingress
+  namespace: booking
+  annotations:
+    # AWS Load Balancer Controller annotations
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internet-facing       # public ALB
+    alb.ingress.kubernetes.io/target-type: ip               # send traffic directly to pod IP
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTPS":443}]'
+    alb.ingress.kubernetes.io/certificate-arn: arn:aws:acm:us-east-1:ACCOUNT:certificate/CERT-ID
+    alb.ingress.kubernetes.io/ssl-policy: ELBSecurityPolicy-TLS13-1-2-2021-06
+    alb.ingress.kubernetes.io/healthcheck-path: /health/ready
+    alb.ingress.kubernetes.io/healthcheck-interval-seconds: "30"
+    alb.ingress.kubernetes.io/success-codes: "200"
+    # WAF: attach AWS WAF to ALB for DDoS and OWASP protection
+    alb.ingress.kubernetes.io/wafv2-acl-arn: arn:aws:wafv2:us-east-1:ACCOUNT:regional/webacl/booking/ID
+    # Access logs stored in S3
+    alb.ingress.kubernetes.io/load-balancer-attributes: >
+      access_logs.s3.enabled=true,
+      access_logs.s3.bucket=booking-alb-logs,
+      access_logs.s3.prefix=prod
+spec:
+  rules:
+    # API traffic — route by path prefix
+    - host: api.bookingplatform.com
+      http:
+        paths:
+          - path: /api/v1/bookings
+            pathType: Prefix
+            backend:
+              service:
+                name: booking-service
+                port:
+                  number: 80
+
+          - path: /api/v1/hotels
+            pathType: Prefix
+            backend:
+              service:
+                name: hotel-service
+                port:
+                  number: 80
+
+          - path: /api/v1/inventory
+            pathType: Prefix
+            backend:
+              service:
+                name: inventory-service
+                port:
+                  number: 80
+
+    # PMS Dashboard (React SPA)
+    - host: dashboard.bookingplatform.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: pms-dashboard
+                port:
+                  number: 80
+---
+# ─── Internal Ingress (for monitoring, only accessible inside VPC) ─────────────
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: monitoring-ingress
+  namespace: monitoring
+  annotations:
+    kubernetes.io/ingress.class: alb
+    alb.ingress.kubernetes.io/scheme: internal   # VPN/VPC only
+    alb.ingress.kubernetes.io/target-type: ip
+    alb.ingress.kubernetes.io/listen-ports: '[{"HTTP":80}]'
+spec:
+  rules:
+    - host: grafana.internal.bookingplatform.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: grafana
+                port:
+                  number: 3000
+
+    - host: jaeger.internal.bookingplatform.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: jaeger-query
+                port:
+                  number: 16686

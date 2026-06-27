@@ -1,0 +1,120 @@
+# ─── Prometheus Alert Rules ───────────────────────────────────────────────────
+# PrometheusRule is a CRD added by kube-prometheus-stack.
+# Prometheus operator watches these and loads them automatically.
+#
+# AlertManager then routes firing alerts to:
+#   - Slack (#alerts channel)
+#   - PagerDuty (on-call rotation for critical alerts)
+
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: booking-platform-alerts
+  namespace: monitoring
+  labels:
+    # kube-prometheus-stack discovers rules with this label
+    release: kube-prometheus-stack
+spec:
+  groups:
+    # ── Booking Service Alerts ───────────────────────────────────────────────
+    - name: booking-service
+      interval: 30s
+      rules:
+
+        # High error rate: >5% of requests returning 5xx in last 5 minutes
+        - alert: BookingServiceHighErrorRate
+          expr: |
+            (
+              sum(rate(http_requests_total{service="booking-service",code=~"5.."}[5m]))
+              /
+              sum(rate(http_requests_total{service="booking-service"}[5m]))
+            ) > 0.05
+          for: 2m
+          labels:
+            severity: critical
+            team: platform
+          annotations:
+            summary: "Booking service error rate > 5%"
+            description: "Error rate is {{ $value | humanizePercentage }}. Check pod logs: kubectl logs -l app=booking-service -n booking"
+
+        # High latency: p95 > 2 seconds
+        - alert: BookingServiceHighLatency
+          expr: |
+            histogram_quantile(0.95,
+              sum(rate(http_request_duration_seconds_bucket{service="booking-service"}[5m])) by (le)
+            ) > 2
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Booking service p95 latency > 2s"
+            description: "p95 latency is {{ $value }}s. Likely DB slow queries or Kafka backlog."
+
+        # Pod count below desired: deployment issue
+        - alert: BookingServicePodsDown
+          expr: |
+            kube_deployment_status_replicas_available{deployment="booking-service",namespace="booking"}
+            < kube_deployment_spec_replicas{deployment="booking-service",namespace="booking"}
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Booking service pods below desired count"
+            description: "Only {{ $value }} pods available. Check: kubectl get pods -n booking"
+
+        # No traffic (possible misconfiguration or dead service)
+        - alert: BookingServiceNoTraffic
+          expr: |
+            sum(rate(http_requests_total{service="booking-service"}[5m])) == 0
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Booking service receiving no traffic"
+
+    # ── Kafka Consumer Lag Alerts ─────────────────────────────────────────────
+    - name: kafka
+      rules:
+        - alert: KafkaConsumerLagHigh
+          expr: kafka_consumer_group_lag{topic="booking-events"} > 1000
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "Kafka consumer lag > 1000 messages on booking-events"
+            description: "Consumer group {{ $labels.consumergroup }} is {{ $value }} messages behind. Notification service may be overloaded."
+
+        - alert: KafkaBrokerDown
+          expr: kafka_brokers < 2
+          for: 2m
+          labels:
+            severity: critical
+          annotations:
+            summary: "Kafka broker count dropped below 2"
+
+    # ── Database Alerts ───────────────────────────────────────────────────────
+    - name: database
+      rules:
+        - alert: PostgresConnectionsHigh
+          expr: |
+            pg_stat_activity_count{datname="bookings_db"} > 15
+          for: 5m
+          labels:
+            severity: warning
+          annotations:
+            summary: "PostgreSQL connections > 15 (pool max is 20)"
+            description: "Connection pool near exhaustion. Consider increasing pool size or adding a connection pooler (PgBouncer)."
+
+    # ── OTA Booking Source Monitoring ─────────────────────────────────────────
+    - name: ota-monitoring
+      rules:
+        # Alert if Expedia bookings suddenly drop (OTA API down?)
+        - alert: ExpediaBookingsDropped
+          expr: |
+            sum(rate(http_requests_total{service="booking-service",source="expedia"}[1h])) == 0
+          for: 30m
+          labels:
+            severity: warning
+          annotations:
+            summary: "No Expedia bookings received in 30 minutes"
+            description: "Possible OTA integration issue. Check Expedia webhook endpoint."

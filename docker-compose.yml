@@ -1,0 +1,310 @@
+## Local Development Stack
+##
+## This runs the EXACT same architecture as EKS, locally.
+## Services use the same environment variables — swap values to target EKS.
+##
+## Usage:
+##   docker-compose up -d
+##   docker-compose logs -f booking-service
+##   docker-compose down -v   # removes volumes (data)
+##
+## URLs:
+##   Booking API:    http://localhost:3001
+##   Hotel API:      http://localhost:3002
+##   Inventory API:  http://localhost:3003
+##   PMS Dashboard:  http://localhost:3000
+##   Grafana:        http://localhost:3030  (admin/admin)
+##   Jaeger UI:      http://localhost:16686
+##   Kafka UI:       http://localhost:8080
+##   Prometheus:     http://localhost:9090
+##   SonarQube:      http://localhost:9000  (admin/admin)
+
+version: '3.9'
+
+networks:
+  booking-network:
+    driver: bridge
+
+volumes:
+  postgres-bookings-data:
+  postgres-hotels-data:
+  redis-data:
+  kafka-data:
+  prometheus-data:
+  grafana-data:
+  jenkins-data:
+
+services:
+
+  # ─── Databases ──────────────────────────────────────────────────────────────
+
+  postgres-bookings:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: bookings_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: dev_password
+    volumes:
+      - postgres-bookings-data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks: [booking-network]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d bookings_db"]
+      interval: 10s
+      retries: 5
+
+  postgres-hotels:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB: hotels_db
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: dev_password
+    volumes:
+      - postgres-hotels-data:/var/lib/postgresql/data
+    ports:
+      - "5433:5432"
+    networks: [booking-network]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d hotels_db"]
+      interval: 10s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    volumes:
+      - redis-data:/data
+    ports:
+      - "6379:6379"
+    networks: [booking-network]
+    command: redis-server --appendonly yes
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+
+  # ─── Kafka ──────────────────────────────────────────────────────────────────
+  # KRaft mode: no ZooKeeper dependency (Kafka 3.x)
+
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
+      # Valid base64-encoded UUID for KRaft cluster ID
+      CLUSTER_ID: MkU3OEVBNTcwNTJENDM2Qg
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    ports:
+      - "9092:9092"
+    networks: [booking-network]
+    healthcheck:
+      test: ["CMD-SHELL", "kafka-topics --bootstrap-server localhost:9092 --list > /dev/null 2>&1"]
+      interval: 15s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  # Creates topics on startup (same as MSK auto.create.topics.enable=false in prod)
+  kafka-setup:
+    image: confluentinc/cp-kafka:7.5.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    networks: [booking-network]
+    command: |
+      bash -c "
+        kafka-topics --create --if-not-exists --topic booking-events --partitions 3 --replication-factor 1 --bootstrap-server kafka:9092
+        kafka-topics --create --if-not-exists --topic hotel-events --partitions 3 --replication-factor 1 --bootstrap-server kafka:9092
+        kafka-topics --create --if-not-exists --topic booking-events-dlq --partitions 1 --replication-factor 1 --bootstrap-server kafka:9092
+        kafka-topics --create --if-not-exists --topic hotel-events-dlq --partitions 1 --replication-factor 1 --bootstrap-server kafka:9092
+        echo 'Topics created'
+      "
+
+  # Kafka UI — see topics, messages, consumer lag in browser
+  kafka-ui:
+    image: provectuslabs/kafka-ui:latest
+    ports:
+      - "8080:8080"
+    environment:
+      KAFKA_CLUSTERS_0_NAME: local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+    networks: [booking-network]
+    depends_on:
+      kafka:
+        condition: service_healthy
+
+  # ─── Microservices ───────────────────────────────────────────────────────────
+
+  booking-service:
+    build:
+      context: ./apps/booking-service
+      target: runtime
+    ports:
+      - "3001:3001"
+    environment:
+      NODE_ENV: development
+      PORT: 3001
+      DB_HOST: postgres-bookings
+      DB_PORT: 5432
+      DB_NAME: bookings_db
+      DB_USER: postgres
+      DB_PASSWORD: dev_password
+      REDIS_URL: redis://redis:6379
+      KAFKA_BROKERS: kafka:9092
+      INVENTORY_SERVICE_URL: http://inventory-service:3003
+      JAEGER_ENDPOINT: http://jaeger:14268/api/traces
+    networks: [booking-network]
+    depends_on:
+      postgres-bookings:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
+  hotel-service:
+    build:
+      context: ./apps/hotel-service
+      target: runtime
+    ports:
+      - "3002:3002"
+    environment:
+      NODE_ENV: development
+      PORT: 3002
+      DB_HOST: postgres-hotels
+      DB_PORT: 5432
+      DB_NAME: hotels_db
+      DB_USER: postgres
+      DB_PASSWORD: dev_password
+      KAFKA_BROKERS: kafka:9092
+      JAEGER_ENDPOINT: http://jaeger:14268/api/traces
+    networks: [booking-network]
+    depends_on:
+      postgres-hotels:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
+  inventory-service:
+    build:
+      context: ./apps/inventory-service
+      target: runtime
+    ports:
+      - "3003:3003"
+    environment:
+      NODE_ENV: development
+      PORT: 3003
+      DB_HOST: postgres-hotels
+      DB_PORT: 5432
+      DB_NAME: hotels_db
+      DB_USER: postgres
+      DB_PASSWORD: dev_password
+      KAFKA_BROKERS: kafka:9092
+    networks: [booking-network]
+    depends_on:
+      postgres-hotels:
+        condition: service_healthy
+    restart: unless-stopped
+
+  notification-service:
+    build:
+      context: ./apps/notification-service
+      target: runtime
+    environment:
+      NODE_ENV: development
+      KAFKA_BROKERS: kafka:9092
+      JAEGER_ENDPOINT: http://jaeger:14268/api/traces
+    networks: [booking-network]
+    depends_on:
+      kafka:
+        condition: service_healthy
+    restart: unless-stopped
+
+  pms-dashboard:
+    build:
+      context: ./apps/pms-dashboard
+    ports:
+      - "3000:80"
+    environment:
+      REACT_APP_BOOKING_API: http://localhost:3001
+      REACT_APP_HOTEL_API: http://localhost:3002
+    networks: [booking-network]
+
+  # ─── Observability ───────────────────────────────────────────────────────────
+
+  prometheus:
+    image: prom/prometheus:v2.47.0
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./docker/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
+      - '--web.enable-lifecycle'    # allows config reload without restart
+    networks: [booking-network]
+
+  grafana:
+    image: grafana/grafana:10.2.0
+    ports:
+      - "3030:3000"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./k8s/monitoring/grafana/dashboard-booking.json:/var/lib/grafana/dashboards/booking.json:ro
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/booking.json
+    networks: [booking-network]
+
+  jaeger:
+    image: jaegertracing/all-in-one:1.51
+    ports:
+      - "16686:16686"   # Jaeger UI
+      - "14268:14268"   # HTTP collector (services send traces here)
+      - "6831:6831/udp" # UDP collector
+    environment:
+      COLLECTOR_ZIPKIN_HOST_PORT: ":9411"
+    networks: [booking-network]
+
+  # ─── CI Tools (local mirrors of what Jenkins uses) ────────────────────────────
+
+  sonarqube:
+    image: sonarqube:10.3-community
+    ports:
+      - "9000:9000"
+    environment:
+      SONAR_ES_BOOTSTRAP_CHECKS_DISABLE: "true"
+    networks: [booking-network]
+    # Note: requires vm.max_map_count=524288 on Linux host
+    # Run: sudo sysctl -w vm.max_map_count=524288
+
+  # ─── Jenkins ─────────────────────────────────────────────────────────────────
+  # Jenkins CI server
+  # First run: get initial password with:
+  #   docker-compose exec jenkins cat /var/jenkins_home/secrets/initialAdminPassword
+  # Then open http://localhost:8090 and paste the password
+  jenkins:
+    image: jenkins/jenkins:lts-jdk17
+    user: root   # needed to run Docker inside Jenkins
+    ports:
+      - "8090:8080"    # Jenkins UI
+      - "50000:50000"  # Jenkins agent port
+    volumes:
+      - jenkins-data:/var/jenkins_home
+      - /var/run/docker.sock:/var/run/docker.sock  # Docker-in-Docker (build images from Jenkins)
+    environment:
+      JAVA_OPTS: "-Djenkins.install.runSetupWizard=false"
+    networks: [booking-network]

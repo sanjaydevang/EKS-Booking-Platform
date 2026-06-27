@@ -1,0 +1,84 @@
+# ─── Service ──────────────────────────────────────────────────────────────────
+# A Service is a stable network endpoint for a set of Pods.
+# Pods are ephemeral — they get new IPs when restarted.
+# The Service IP (ClusterIP) never changes, so other services can always find it.
+#
+# Service Types:
+#   ClusterIP   — internal only (default) — other pods in the cluster use this
+#   NodePort    — exposes on every node's IP:port (not for production)
+#   LoadBalancer — creates an AWS ALB/NLB (expensive, use Ingress instead)
+#
+# We use ClusterIP here. External traffic comes in via Ingress → Service → Pods.
+
+apiVersion: v1
+kind: Service
+metadata:
+  name: booking-service
+  namespace: booking
+  labels:
+    app: booking-service
+  annotations:
+    # Prometheus ServiceMonitor discovery
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "3001"
+spec:
+  type: ClusterIP
+  # Selector matches pods with these labels.
+  # The Service load-balances traffic across ALL matching pods (round-robin).
+  selector:
+    app: booking-service
+  ports:
+    - name: http
+      port: 80          # port that other services use: http://booking-service:80
+      targetPort: 3001  # port inside the container
+      protocol: TCP
+    - name: metrics
+      port: 9090
+      targetPort: 3001  # /metrics is on the same port in our setup
+---
+# ─── HPA (Horizontal Pod Autoscaler) ─────────────────────────────────────────
+# Automatically scales the number of pods based on CPU/memory usage.
+# When Expedia sends a batch of bookings and CPU spikes → HPA adds pods.
+# When traffic drops → HPA removes pods to save cost.
+#
+# Prerequisite: metrics-server must be installed in the cluster.
+# EKS: aws eks create-addon --cluster-name booking-platform --addon-name metrics-server
+
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: booking-service-hpa
+  namespace: booking
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: booking-service
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70  # scale up when average CPU > 70%
+    - type: Resource
+      resource:
+        name: memory
+        target:
+          type: Utilization
+          averageUtilization: 80
+  behavior:
+    scaleUp:
+      stabilizationWindowSeconds: 60   # wait 60s before scaling up again
+      policies:
+        - type: Pods
+          value: 2
+          periodSeconds: 60            # add at most 2 pods per minute
+    scaleDown:
+      stabilizationWindowSeconds: 300  # wait 5 mins before scaling down
+      policies:
+        - type: Pods
+          value: 1
+          periodSeconds: 120           # remove at most 1 pod per 2 minutes

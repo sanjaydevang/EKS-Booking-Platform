@@ -1,0 +1,415 @@
+/**
+ * ─────────────────────────────────────────────────────────────────────────────
+ *  BOOKING PLATFORM — FULL CI/CD PIPELINE
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * STAGE FLOW:
+ *
+ *   Checkout → Install → Unit Tests → SonarQube Analysis
+ *       → Quality Gate (wait for SonarQube to return pass/fail)
+ *       → Build Docker Image
+ *       → Trivy Scan (vulnerability scan on image)
+ *       → Push to ECR
+ *       → Deploy to EKS (rolling update)
+ *       → Integration Tests
+ *       → Smoke Tests
+ *       → Notify
+ *
+ * TRIGGERED BY: GitHub webhook on push to main or PR merge
+ *
+ * JENKINS PREREQUISITES:
+ *   - aws-credentials plugin       (for ECR push + kubectl)
+ *   - kubernetes plugin            (for dynamic build agents on EKS)
+ *   - sonarqube plugin             (for SonarQube integration)
+ *   - docker pipeline plugin
+ *   - slack notification plugin
+ */
+
+pipeline {
+  // Run build on a Kubernetes pod agent — ephemeral, no shared state between builds
+  agent {
+    kubernetes {
+      label 'booking-platform-build'
+      yaml '''
+        apiVersion: v1
+        kind: Pod
+        spec:
+          serviceAccountName: jenkins-sa  # has permission to push to ECR and deploy to EKS
+          containers:
+            - name: node
+              image: node:20-alpine
+              command: [cat]
+              tty: true
+              resources:
+                requests:
+                  cpu: "500m"
+                  memory: "1Gi"
+            - name: docker
+              image: docker:24-dind
+              command: [cat]
+              tty: true
+              securityContext:
+                privileged: true  # required for Docker-in-Docker
+              volumeMounts:
+                - name: docker-socket
+                  mountPath: /var/run/docker.sock
+            - name: kubectl
+              image: bitnami/kubectl:1.28
+              command: [cat]
+              tty: true
+            - name: trivy
+              image: aquasec/trivy:latest
+              command: [cat]
+              tty: true
+          volumes:
+            - name: docker-socket
+              hostPath:
+                path: /var/run/docker.sock
+      '''
+    }
+  }
+
+  // ─── Parameters ─────────────────────────────────────────────────────────────
+  parameters {
+    string(name: 'SERVICE', defaultValue: 'booking-service', description: 'Service to build')
+    choice(name: 'ENVIRONMENT', choices: ['dev', 'staging', 'prod'], description: 'Target environment')
+    booleanParam(name: 'SKIP_TESTS', defaultValue: false, description: 'Skip tests (emergency deploys only)')
+    booleanParam(name: 'FORCE_DEPLOY', defaultValue: false, description: 'Deploy even if quality gate fails')
+  }
+
+  // ─── Environment Variables ───────────────────────────────────────────────────
+  environment {
+    SERVICE_NAME    = "${params.SERVICE}"
+    ENVIRONMENT     = "${params.ENVIRONMENT}"
+    AWS_REGION      = 'us-east-1'
+    AWS_ACCOUNT_ID  = credentials('aws-account-id')
+    ECR_REGISTRY    = "${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
+    IMAGE_NAME      = "${ECR_REGISTRY}/${SERVICE_NAME}"
+    IMAGE_TAG       = "${BUILD_NUMBER}-${GIT_COMMIT.take(7)}"
+    SONAR_HOST      = 'http://sonarqube.internal.bookingplatform.com'
+    K8S_NAMESPACE   = 'booking'
+    SLACK_CHANNEL   = '#deployments'
+  }
+
+  options {
+    timeout(time: 30, unit: 'MINUTES')
+    buildDiscarder(logRotator(numToKeepStr: '20'))
+    disableConcurrentBuilds(abortPrevious: true)  // if a new build starts, cancel the old one
+    timestamps()
+  }
+
+  stages {
+
+    // ── 1. CHECKOUT ────────────────────────────────────────────────────────────
+    stage('Checkout') {
+      steps {
+        checkout scm
+        script {
+          env.GIT_COMMIT_MSG = sh(script: 'git log -1 --pretty=%B', returnStdout: true).trim()
+          env.GIT_AUTHOR = sh(script: 'git log -1 --pretty=%an', returnStdout: true).trim()
+          echo "Building ${SERVICE_NAME} — commit by ${GIT_AUTHOR}: ${GIT_COMMIT_MSG}"
+        }
+      }
+    }
+
+    // ── 2. INSTALL DEPENDENCIES ────────────────────────────────────────────────
+    stage('Install') {
+      steps {
+        container('node') {
+          dir("apps/${SERVICE_NAME}") {
+            sh 'npm ci'   // npm ci is reproducible — uses exact versions from package-lock.json
+          }
+        }
+      }
+    }
+
+    // ── 3. LINT ────────────────────────────────────────────────────────────────
+    stage('Lint') {
+      when { not { expression { params.SKIP_TESTS } } }
+      steps {
+        container('node') {
+          dir("apps/${SERVICE_NAME}") {
+            sh 'npm run lint 2>&1 | tee lint-results.txt || true'
+          }
+        }
+      }
+    }
+
+    // ── 4. UNIT TESTS ──────────────────────────────────────────────────────────
+    stage('Unit Tests') {
+      when { not { expression { params.SKIP_TESTS } } }
+      steps {
+        container('node') {
+          dir("apps/${SERVICE_NAME}") {
+            sh '''
+              npm test -- \
+                --ci \
+                --coverage \
+                --forceExit \
+                --reporters=default \
+                --reporters=jest-junit
+            '''
+          }
+        }
+      }
+      post {
+        always {
+          // Publish test results in Jenkins UI
+          junit allowEmptyResults: true, testResults: "apps/${SERVICE_NAME}/junit.xml"
+          // Publish coverage report
+          publishHTML([
+            allowMissing: true,
+            keepAll: true,
+            reportDir: "apps/${SERVICE_NAME}/coverage/lcov-report",
+            reportFiles: 'index.html',
+            reportName: 'Coverage Report'
+          ])
+        }
+      }
+    }
+
+    // ── 5. SONARQUBE ANALYSIS ──────────────────────────────────────────────────
+    // SonarQube scans for:
+    //   - Code smells (maintainability issues)
+    //   - Bugs (likely runtime errors)
+    //   - Vulnerabilities (security issues in code)
+    //   - Coverage threshold (fail if < 70% covered)
+    //   - Duplications
+    stage('SonarQube Analysis') {
+      when { not { expression { params.SKIP_TESTS } } }
+      steps {
+        container('node') {
+          dir("apps/${SERVICE_NAME}") {
+            withSonarQubeEnv('SonarQube') {  // 'SonarQube' is the name configured in Jenkins
+              sh """
+                npx sonar-scanner \
+                  -Dsonar.projectKey=${SERVICE_NAME} \
+                  -Dsonar.projectName="${SERVICE_NAME} Booking Platform" \
+                  -Dsonar.projectVersion=${IMAGE_TAG} \
+                  -Dsonar.sources=src \
+                  -Dsonar.tests=test \
+                  -Dsonar.javascript.lcov.reportPaths=coverage/lcov.info \
+                  -Dsonar.testExecutionReportPaths=test-report.xml \
+                  -Dsonar.host.url=${SONAR_HOST} \
+                  -Dsonar.branch.name=${env.BRANCH_NAME}
+              """
+            }
+          }
+        }
+      }
+    }
+
+    // ── 6. SONARQUBE QUALITY GATE ──────────────────────────────────────────────
+    // This PAUSES the pipeline and waits for SonarQube to finish analysis.
+    // If Quality Gate fails (e.g., coverage < 70%, new bugs found), pipeline STOPS.
+    // This prevents bad code from ever reaching a container image.
+    stage('Quality Gate') {
+      when {
+        allOf {
+          not { expression { params.SKIP_TESTS } }
+          not { expression { params.FORCE_DEPLOY } }
+        }
+      }
+      steps {
+        timeout(time: 5, unit: 'MINUTES') {
+          waitForQualityGate abortPipeline: true
+        }
+      }
+    }
+
+    // ── 7. BUILD DOCKER IMAGE ──────────────────────────────────────────────────
+    stage('Build Docker Image') {
+      steps {
+        container('docker') {
+          dir("apps/${SERVICE_NAME}") {
+            sh """
+              docker build \
+                --build-arg BUILD_DATE=\$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+                --build-arg VCS_REF=${GIT_COMMIT} \
+                --build-arg VERSION=${IMAGE_TAG} \
+                --cache-from ${IMAGE_NAME}:latest \
+                --tag ${IMAGE_NAME}:${IMAGE_TAG} \
+                --tag ${IMAGE_NAME}:latest \
+                --file Dockerfile \
+                .
+            """
+          }
+        }
+      }
+    }
+
+    // ── 8. TRIVY SECURITY SCAN ─────────────────────────────────────────────────
+    // Trivy scans the Docker image for:
+    //   - OS package vulnerabilities (Alpine packages)
+    //   - Application dependency vulnerabilities (node_modules CVEs)
+    //   - Secrets accidentally baked into the image
+    //   - Misconfigurations in the Dockerfile
+    //
+    // EXIT CODES:
+    //   0 = no vulnerabilities at or above severity threshold
+    //   1 = vulnerabilities found (pipeline fails)
+    stage('Trivy Security Scan') {
+      steps {
+        container('trivy') {
+          sh """
+            trivy image \
+              --exit-code 1 \
+              --severity HIGH,CRITICAL \
+              --ignore-unfixed \
+              --no-progress \
+              --format table \
+              --output trivy-report.txt \
+              ${IMAGE_NAME}:${IMAGE_TAG}
+          """
+
+          // Also generate JSON for programmatic processing
+          sh """
+            trivy image \
+              --exit-code 0 \
+              --severity HIGH,CRITICAL \
+              --format json \
+              --output trivy-report.json \
+              ${IMAGE_NAME}:${IMAGE_TAG}
+          """
+        }
+      }
+      post {
+        always {
+          archiveArtifacts artifacts: 'trivy-report.*', allowEmptyArchive: true
+          // Publish as HTML report in Jenkins
+          publishHTML([
+            allowMissing: true,
+            keepAll: true,
+            reportDir: '.',
+            reportFiles: 'trivy-report.txt',
+            reportName: 'Trivy Security Report'
+          ])
+        }
+      }
+    }
+
+    // ── 9. PUSH TO ECR ─────────────────────────────────────────────────────────
+    // ECR = Elastic Container Registry (AWS's private Docker registry)
+    // Only push AFTER quality gate + trivy pass
+    stage('Push to ECR') {
+      steps {
+        container('docker') {
+          withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-credentials']]) {
+            sh """
+              aws ecr get-login-password --region ${AWS_REGION} \
+                | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+
+              docker push ${IMAGE_NAME}:${IMAGE_TAG}
+              docker push ${IMAGE_NAME}:latest
+
+              echo "Pushed: ${IMAGE_NAME}:${IMAGE_TAG}"
+            """
+          }
+        }
+      }
+    }
+
+    // ── 10. DEPLOY TO EKS ─────────────────────────────────────────────────────
+    // kubectl set image triggers a rolling update.
+    // K8s replaces pods one by one, waiting for readiness probes between each.
+    // If readiness fails → rollout stops and alerts fire.
+    stage('Deploy to EKS') {
+      steps {
+        container('kubectl') {
+          withCredentials([[$class: 'AmazonWebServicesCredentialsBinding', credentialsId: 'aws-credentials']]) {
+            sh """
+              aws eks update-kubeconfig \
+                --region ${AWS_REGION} \
+                --name booking-platform-${ENVIRONMENT}
+
+              # Rolling update: update the image, K8s handles the rest
+              kubectl set image deployment/${SERVICE_NAME} \
+                ${SERVICE_NAME}=${IMAGE_NAME}:${IMAGE_TAG} \
+                -n ${K8S_NAMESPACE}
+
+              # Annotate for audit trail
+              kubectl annotate deployment/${SERVICE_NAME} \
+                kubernetes.io/change-cause="Jenkins build ${BUILD_NUMBER} — ${GIT_COMMIT.take(7)} by ${GIT_AUTHOR}" \
+                -n ${K8S_NAMESPACE} --overwrite
+
+              # Wait for rollout to complete (readiness probe must pass for ALL pods)
+              kubectl rollout status deployment/${SERVICE_NAME} \
+                -n ${K8S_NAMESPACE} \
+                --timeout=5m
+            """
+          }
+        }
+      }
+    }
+
+    // ── 11. INTEGRATION TESTS ─────────────────────────────────────────────────
+    // Run against the live deployed service to verify end-to-end behavior
+    stage('Integration Tests') {
+      when { not { expression { params.SKIP_TESTS } } }
+      steps {
+        container('node') {
+          sh """
+            export API_URL=http://api.bookingplatform.com
+            npm run test:integration --prefix apps/${SERVICE_NAME}
+          """
+        }
+      }
+    }
+
+    // ── 12. SMOKE TESTS ───────────────────────────────────────────────────────
+    stage('Smoke Tests') {
+      steps {
+        container('node') {
+          sh """
+            # Quick health check against the real endpoint
+            curl -f http://booking-service.booking.svc.cluster.local/health/ready || exit 1
+            echo "Smoke test passed"
+          """
+        }
+      }
+    }
+  }
+
+  // ─── Post Actions (always run, even on failure) ────────────────────────────
+  post {
+    success {
+      slackSend(
+        channel: env.SLACK_CHANNEL,
+        color: 'good',
+        message: """
+          ✅ *${SERVICE_NAME}* deployed to *${ENVIRONMENT}*
+          Build: <${BUILD_URL}|#${BUILD_NUMBER}> | Image: `${IMAGE_TAG}`
+          Commit: ${GIT_COMMIT_MSG} by ${GIT_AUTHOR}
+        """
+      )
+    }
+    failure {
+      slackSend(
+        channel: env.SLACK_CHANNEL,
+        color: 'danger',
+        message: """
+          ❌ *${SERVICE_NAME}* deploy FAILED on *${ENVIRONMENT}*
+          Build: <${BUILD_URL}|#${BUILD_NUMBER}> | Stage: ${currentBuild.result}
+          Commit: ${GIT_COMMIT_MSG} by ${GIT_AUTHOR}
+        """
+      )
+      // Auto-rollback on production failure
+      script {
+        if (params.ENVIRONMENT == 'prod') {
+          container('kubectl') {
+            sh """
+              kubectl rollout undo deployment/${SERVICE_NAME} -n ${K8S_NAMESPACE}
+              echo "⚠️ Auto-rolled back ${SERVICE_NAME} on prod"
+            """
+          }
+        }
+      }
+    }
+    always {
+      // Clean up Docker images from build agent to save disk
+      container('docker') {
+        sh "docker rmi ${IMAGE_NAME}:${IMAGE_TAG} || true"
+      }
+    }
+  }
+}

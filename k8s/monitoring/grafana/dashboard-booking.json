@@ -1,0 +1,110 @@
+{
+  "__comment": "Import this JSON into Grafana: Dashboards → Import → Paste JSON",
+  "title": "Booking Platform — PMS Dashboard",
+  "uid": "booking-platform-pms",
+  "version": 1,
+  "refresh": "30s",
+  "time": { "from": "now-24h", "to": "now" },
+  "panels": [
+    {
+      "id": 1,
+      "title": "Total Bookings (last 24h)",
+      "type": "stat",
+      "gridPos": { "x": 0, "y": 0, "w": 4, "h": 4 },
+      "targets": [{
+        "expr": "sum(increase(http_requests_total{service='booking-service', method='POST', handler='/api/v1/bookings', code='201'}[24h]))",
+        "legendFormat": "Total Bookings"
+      }]
+    },
+    {
+      "id": 2,
+      "title": "Bookings by OTA Source",
+      "type": "piechart",
+      "gridPos": { "x": 4, "y": 0, "w": 8, "h": 8 },
+      "targets": [{
+        "expr": "sum by (source) (increase(bookings_created_total[24h]))",
+        "legendFormat": "{{source}}"
+      }]
+    },
+    {
+      "id": 3,
+      "title": "Request Rate (req/s)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "sum(rate(http_requests_total{service='booking-service'}[5m]))",
+          "legendFormat": "booking-service"
+        },
+        {
+          "expr": "sum(rate(http_requests_total{service='hotel-service'}[5m]))",
+          "legendFormat": "hotel-service"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "title": "p50/p95/p99 Latency (ms)",
+      "type": "timeseries",
+      "gridPos": { "x": 12, "y": 0, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(http_request_duration_seconds_bucket{service='booking-service'}[5m])) by (le)) * 1000",
+          "legendFormat": "p50"
+        },
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket{service='booking-service'}[5m])) by (le)) * 1000",
+          "legendFormat": "p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(http_request_duration_seconds_bucket{service='booking-service'}[5m])) by (le)) * 1000",
+          "legendFormat": "p99"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Error Rate (%)",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 12, "w": 12, "h": 8 },
+      "targets": [{
+        "expr": "sum(rate(http_requests_total{service='booking-service',code=~'5..'}[5m])) / sum(rate(http_requests_total{service='booking-service'}[5m])) * 100",
+        "legendFormat": "Error %"
+      }],
+      "thresholds": {
+        "mode": "absolute",
+        "steps": [{"color": "green"}, {"color": "red", "value": 5}]
+      }
+    },
+    {
+      "id": 6,
+      "title": "Pod Count (booking-service)",
+      "type": "stat",
+      "gridPos": { "x": 12, "y": 12, "w": 4, "h": 4 },
+      "targets": [{
+        "expr": "kube_deployment_status_replicas_available{deployment='booking-service',namespace='booking'}",
+        "legendFormat": "Available Pods"
+      }]
+    },
+    {
+      "id": 7,
+      "title": "Kafka Consumer Lag",
+      "type": "timeseries",
+      "gridPos": { "x": 0, "y": 20, "w": 12, "h": 8 },
+      "targets": [{
+        "expr": "kafka_consumer_group_lag{topic='booking-events'}",
+        "legendFormat": "{{consumergroup}}"
+      }]
+    },
+    {
+      "id": 8,
+      "title": "Active Hotels",
+      "type": "stat",
+      "gridPos": { "x": 16, "y": 0, "w": 4, "h": 4 },
+      "targets": [{
+        "expr": "hotels_active_total",
+        "legendFormat": "Active Hotels"
+      }]
+    }
+  ]
+}

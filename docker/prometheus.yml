@@ -1,0 +1,19 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: 'booking-service'
+    static_configs:
+      - targets: ['booking-service:3001']
+    metrics_path: /metrics
+
+  - job_name: 'hotel-service'
+    static_configs:
+      - targets: ['hotel-service:3002']
+    metrics_path: /metrics
+
+  - job_name: 'inventory-service'
+    static_configs:
+      - targets: ['inventory-service:3003']
+    metrics_path: /metrics

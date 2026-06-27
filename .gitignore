@@ -1,0 +1,41 @@
+# Dependencies — never commit these
+node_modules/
+**/node_modules/
+
+# Environment files — contain secrets
+.env
+.env.*
+*.env
+
+# Build output
+dist/
+build/
+coverage/
+*.lcov
+
+# Terraform state — contains secrets, use S3 backend
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+.terraform/
+.terraform.lock.hcl
+terraform.tfvars
+
+# Docker volumes / local data
+data/
+logs/
+
+# Test reports
+junit.xml
+test-report.xml
+trivy-report.*
+
+# IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Generated output
+output/
+reports/

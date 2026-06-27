@@ -1,0 +1,65 @@
+# ─── Namespaces ───────────────────────────────────────────────────────────────
+# Namespaces are like folders in K8s — they isolate resources, apply RBAC,
+# and allow per-namespace resource quotas.
+#
+# We use 3 namespaces:
+#   booking     — all application microservices
+#   monitoring  — Prometheus, Grafana, Jaeger
+#   kafka       — Kafka brokers and Zookeeper
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: booking
+  labels:
+    name: booking
+    env: production
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: monitoring
+  labels:
+    name: monitoring
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kafka
+  labels:
+    name: kafka
+---
+# ResourceQuota: prevent one namespace from consuming all cluster resources
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: booking-quota
+  namespace: booking
+spec:
+  hard:
+    requests.cpu: "8"
+    requests.memory: 16Gi
+    limits.cpu: "16"
+    limits.memory: 32Gi
+    pods: "50"
+    services: "20"
+---
+# LimitRange: sets defaults so every pod has resource requests/limits
+# even if the developer forgets to specify them
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: booking-limits
+  namespace: booking
+spec:
+  limits:
+    - type: Container
+      default:
+        cpu: "500m"
+        memory: "256Mi"
+      defaultRequest:
+        cpu: "100m"
+        memory: "128Mi"
+      max:
+        cpu: "2"
+        memory: "2Gi"
