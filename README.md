@@ -4,7 +4,7 @@ A production-grade hotel booking platform built on AWS EKS. This is a **learning
 
 ---
 
-## What You'll Learn
+## 
 
 | Topic | Where |
 |-------|-------|
